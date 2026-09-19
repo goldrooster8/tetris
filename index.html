@@ -1,4 +1,3 @@
-
 <!doctype html>
 <html lang="en">
   <head>
@@ -324,12 +323,14 @@ input {
   align-items: end;
   gap: 14px;
   margin-bottom: 10px;
+  flex-wrap: wrap;
 }
 
 .status-line {
   color: var(--muted);
   font-weight: 700;
   text-align: right;
+  flex: 1 1 220px;
 }
 
 .local-hand {
@@ -565,6 +566,7 @@ button.card {
               <strong id="localSumLabel">0 / 21</strong>
             </div>
             <div id="statusLine" class="status-line">Waiting for players.</div>
+            <button id="startBtn" class="hidden" type="button">Start Game</button>
           </div>
           <div id="localHand" class="local-hand"></div>
         </footer>
@@ -647,6 +649,7 @@ const els = {
   middlePile: document.querySelector("#middlePile"),
   localSumLabel: document.querySelector("#localSumLabel"),
   statusLine: document.querySelector("#statusLine"),
+  startBtn: document.querySelector("#startBtn"),
   localHand: document.querySelector("#localHand"),
   choiceModal: document.querySelector("#choiceModal"),
   choiceTitle: document.querySelector("#choiceTitle"),
@@ -704,29 +707,33 @@ function makeRoomCode() {
   return Math.random().toString(36).slice(2, 8).toUpperCase();
 }
 
+function randInt(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+/**
+ * Normal card values:
+ *   20% -> 0
+ *   60% -> 1..6  (uniform)
+ *   20% -> 7..12 (uniform)
+ */
+function rollNormalValue() {
+  const r = Math.random();
+  if (r < 0.2) return 0;
+  if (r < 0.8) return randInt(1, 6);
+  return randInt(7, 12);
+}
+
 function makeCard() {
   const color = CONFIG.colors[Math.floor(Math.random() * CONFIG.colors.length)];
   const roll = Math.random();
   if (roll < 0.75) {
-    const normalRoll = Math.random();
-    let value;
-    if (normalRoll < 0.10) {
-      value = 0;
-    } else if (normalRoll < 0.80) {
-      value = randInt(1, 8);
-    } else {
-      value = randInt(9, 12);
-    }
-    return { id: crypto.randomUUID(), color, type: "normal", value };
+    return { id: crypto.randomUUID(), color, type: "normal", value: rollNormalValue() };
   }
 
   const specialKeys = Object.keys(CONFIG.specialTypes);
   const type = specialKeys[Math.floor(Math.random() * specialKeys.length)];
   return { id: crypto.randomUUID(), color, type, value: CONFIG.specialTypes[type].value };
-}
-
-function randInt(min, max) {
-  return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
 function drawCards(count) {
@@ -806,7 +813,7 @@ function nextTurnPatch(game, playerId, options = {}) {
   const nextPlayer = game.players?.[nextPlayerId];
   if (nextPlayer?.over21Pending) {
     patch.phase = "clutch";
-    patch.message = `${nextPlayer.name} must clutch.`;
+    patch.message = `${nextPlayer.name} must clutch (get back to 21 or less).`;
   }
   return patch;
 }
@@ -830,7 +837,7 @@ async function createRoom() {
     discard: [],
     pending: null,
     phase: "waiting",
-    message: "Waiting for another player.",
+    message: "Waiting for players (1/2). The host can start when ready.",
     winnerId: null,
     loserId: null,
     players: {
@@ -888,18 +895,35 @@ async function joinRoom() {
       current.players[localPlayerId].connected = true;
       current.players[localPlayerId].name = name;
     }
-    if (current.turnOrder.length >= CONFIG.minPlayers) {
-      current.status = "playing";
-      current.phase = "turn";
-      current.activePlayerId = current.turnOrder[0];
-      current.turnStartedAt = Date.now();
-      current.message = "Game started.";
-    }
+    // NOTE: we intentionally do NOT auto-start the game here.
+    const count = current.turnOrder.length;
+    current.message =
+      count < CONFIG.minPlayers
+        ? `Waiting for players (${count}/${CONFIG.minPlayers}).`
+        : `${count} player${count === 1 ? "" : "s"} ready. The host can start the game.`;
     return current;
   });
 
   await onDisconnect(playerRef(code, localPlayerId)).update({ connected: false });
   enterRoom(code);
+}
+
+async function startGame() {
+  await runTransaction(roomRef(currentRoomCode), (game) => {
+    if (!game || game.status !== "waiting") return game;
+    if (game.hostId !== localPlayerId) return game;
+    const order = game.turnOrder || [];
+    if (order.length < CONFIG.minPlayers) return game;
+
+    game.status = "playing";
+    game.phase = "turn";
+    game.activePlayerId = order[0];
+    game.turnStartedAt = Date.now();
+    game.turnForcedAddResolved = false;
+    game.pending = null;
+    game.message = "Game started. Good luck!";
+    return game;
+  });
 }
 
 function enterRoom(code) {
@@ -925,13 +949,23 @@ function render() {
   const players = sortPlayers(game.players, game.turnOrder);
   const active = game.players?.[game.activePlayerId];
   const isLocalTurn = game.activePlayerId === localPlayerId && game.status === "playing";
+  const isHost = game.hostId === localPlayerId;
+  const canStart =
+    game.status === "waiting" &&
+    isHost &&
+    (game.turnOrder || []).length >= CONFIG.minPlayers;
 
   els.turnLabel.textContent = active?.name || "Waiting";
   els.middleSumLabel.textContent = `${middleSum(game)} / ${CONFIG.middleLimit}`;
   els.localSumLabel.textContent = `${sumCards(local?.hand || [])} / ${CONFIG.handLimit}`;
   els.statusLine.textContent = game.message || "";
   els.turnBanner.classList.toggle("hidden", !isLocalTurn);
-  els.deckBtn.disabled = !isLocalTurn || game.phase !== "turn" || Boolean(game.pending) || resolvingChoice;
+  els.startBtn.classList.toggle("hidden", !canStart);
+  els.deckBtn.disabled =
+    !isLocalTurn ||
+    game.phase !== "turn" ||
+    Boolean(game.pending) ||
+    resolvingChoice;
 
   renderSeats(players, game);
   renderCards(els.middlePile, game.middle || [], { interactive: game.pending?.type === "discardTarget" });
@@ -1021,6 +1055,8 @@ function createCardElement(card, asButton) {
 
 function renderTimer(game) {
   clearInterval(timerInterval);
+  let fired = false;
+
   const updateTimer = () => {
     if (game.status !== "playing") {
       els.timerLabel.textContent = "--";
@@ -1029,10 +1065,23 @@ function renderTimer(game) {
     const elapsed = Math.floor((Date.now() - Number(game.turnStartedAt || Date.now())) / 1000);
     const remaining = Math.max(0, CONFIG.turnSeconds - elapsed);
     els.timerLabel.textContent = String(remaining);
-    if (remaining === 0 && game.activePlayerId === localPlayerId && !game.pending) {
-      autoDrawForTimeout();
+
+    if (
+      remaining === 0 &&
+      !fired &&
+      game.activePlayerId === localPlayerId &&
+      !game.pending &&
+      !resolvingChoice
+    ) {
+      fired = true;
+      if (game.phase === "clutch") {
+        loseGame(`${game.players?.[localPlayerId]?.name || "Player"} ran out of time while clutching.`);
+      } else {
+        autoDrawForTimeout();
+      }
     }
   };
+
   updateTimer();
   timerInterval = setInterval(updateTimer, 300);
 }
@@ -1049,10 +1098,19 @@ function renderGameOver(game) {
 
 async function maybeHandleTurnAutomation() {
   const game = latestGame;
-  if (!game || game.status !== "playing" || game.activePlayerId !== localPlayerId || game.pending || resolvingChoice) return;
+  if (
+    !game ||
+    game.status !== "playing" ||
+    game.activePlayerId !== localPlayerId ||
+    game.pending ||
+    resolvingChoice
+  ) {
+    return;
+  }
   const player = game.players?.[localPlayerId];
   if (!player) return;
 
+  // Forced draws from active ADD cards at the start of your turn.
   if (!game.turnForcedAddResolved) {
     const addCount = activeAdds(game);
     if (addCount > 0) {
@@ -1061,14 +1119,17 @@ async function maybeHandleTurnAutomation() {
     }
   }
 
-  if ((game.phase === "clutch" || player.over21Pending || sumCards(player.hand || []) > CONFIG.handLimit) && playableCards(game, player).length === 0) {
-    await loseGame(`${player.name} could not clutch.`);
+  // Clutch: you went over 21 earlier and now must get back under.
+  // If you have no legal play left, you bust.
+  const isOver = sumCards(player.hand || []) > CONFIG.handLimit;
+  const isClutch = game.phase === "clutch" || player.over21Pending;
+  if (isClutch && isOver && playableCards(game, player).length === 0) {
+    await loseGame(`${player.name} could not clutch and busted.`);
     return;
   }
 
-  if (sumCards(player.hand || []) <= CONFIG.handLimit && playableCards(game, player).length === 0) {
-    await drawAction(true);
-  }
+  // NOTE: We deliberately do NOT auto-draw when the player simply has no
+  // playable cards. The player must click the deck themselves.
 }
 
 async function resolveAddDraws(addCount) {
@@ -1080,8 +1141,8 @@ async function resolveAddDraws(addCount) {
     const total = sumCards(player.hand);
     if (total > CONFIG.handLimit) {
       game.phase = "clutch";
-      player.over21Pending = false;
-      game.message = `${player.name} drew ${addCount} from Add and must clutch now.`;
+      player.over21Pending = true;
+      game.message = `${player.name} drew ${addCount} from Add and is over 21 — clutch now!`;
     } else {
       game.message = `${player.name} drew ${addCount} from active Add card${addCount === 1 ? "" : "s"}.`;
     }
@@ -1096,9 +1157,14 @@ async function drawAction(forced = false) {
     player.hand = [...(player.hand || []), makeCard()];
     const over = sumCards(player.hand) > CONFIG.handLimit;
     if (over) player.over21Pending = true;
-    Object.assign(game, nextTurnPatch(game, localPlayerId, {
-      message: forced ? `${player.name} had no playable cards and drew.` : `${player.name} drew a card.`
-    }));
+    Object.assign(
+      game,
+      nextTurnPatch(game, localPlayerId, {
+        message: forced
+          ? `${player.name} had no playable cards and drew.`
+          : `${player.name} drew a card.`
+      })
+    );
     return game;
   });
 }
@@ -1133,10 +1199,14 @@ async function playCard(cardId) {
 
   if (card.type === "switch") {
     const targets = sortPlayers(game.players, game.turnOrder).filter((item) => item.id !== localPlayerId);
-    showChoice("Switch", "Choose a player to swap hands with.", targets.map((target) => ({
-      label: target.name,
-      action: () => resolveSwitch(cardId, target.id)
-    })));
+    showChoice(
+      "Switch",
+      "Choose a player to swap hands with.",
+      targets.map((target) => ({
+        label: target.name,
+        action: () => resolveSwitch(cardId, target.id)
+      }))
+    );
     return;
   }
 
@@ -1171,25 +1241,61 @@ async function commitPlayedCard(cardId, message = null) {
     if (!card || !canPlayCard(game, card)) return game;
     player.hand = player.hand.filter((item) => item.id !== cardId);
     game.middle = applyFlushes([...(game.middle || []), card]);
-    finishAfterPlay(game, player, message || `${player.name} played ${card.type === "normal" ? card.value : CONFIG.specialTypes[card.type].label}.`);
+    finishAfterPlay(
+      game,
+      player,
+      message ||
+        `${player.name} played ${card.type === "normal" ? card.value : CONFIG.specialTypes[card.type].label}.`
+    );
     return game;
   });
 }
 
+/**
+ * Called after a card has been played / resolved.
+ *
+ * Clutch rule:
+ *  - If the player is at or below 21, their turn ends normally.
+ *  - If they are above 21, they are marked over21Pending.
+ *    * If it is already their clutch turn, they must keep playing until they
+ *      are back at 21 or less. If they run out of legal plays, they bust.
+ *    * If it was a normal turn, the turn passes; they will clutch on their
+ *      next turn instead of losing immediately.
+ */
 function finishAfterPlay(game, player, message) {
-  const stillOver = sumCards(player.hand || []) > CONFIG.handLimit;
-  if (game.phase === "clutch" || player.over21Pending) {
-    if (stillOver) {
-      game.status = "gameOver";
-      game.loserId = player.id;
-      game.winnerId = null;
-      game.message = `${player.name} failed the clutch.`;
+  const wasClutch = game.phase === "clutch" || player.over21Pending;
+  const total = sumCards(player.hand || []);
+
+  if (total <= CONFIG.handLimit) {
+    player.over21Pending = false;
+    Object.assign(game, nextTurnPatch(game, player.id, { message }));
+    return;
+  }
+
+  // Still over 21.
+  player.over21Pending = true;
+
+  if (wasClutch) {
+    // Keep the turn with this player if they still have legal plays.
+    if (playableCards(game, player).length > 0) {
+      game.phase = "clutch";
+      game.activePlayerId = player.id;
+      game.turnStartedAt = Date.now();
+      game.turnForcedAddResolved = true;
+      game.pending = null;
+      game.message = `${player.name} is still over 21 — keep playing to clutch.`;
       return;
     }
-    player.over21Pending = false;
-  } else if (stillOver) {
-    player.over21Pending = true;
+
+    // No legal plays left: they bust.
+    game.status = "gameOver";
+    game.loserId = player.id;
+    game.winnerId = null;
+    game.message = `${player.name} could not clutch and busted.`;
+    return;
   }
+
+  // Normal turn that ended over 21: pass the turn, clutch next time.
   Object.assign(game, nextTurnPatch(game, player.id, { message }));
 }
 
@@ -1226,7 +1332,11 @@ function promptTwoOneDiscards() {
     label: `${cardLabel(card)} (${card.color})`,
     action: () => toggleTwoOneDiscard(card.id)
   }));
-  showChoice("Discard from hand", `Choose ${pending.discardCount} card${pending.discardCount === 1 ? "" : "s"} to discard.`, actions);
+  showChoice(
+    "Discard from hand",
+    `Choose ${pending.discardCount} card${pending.discardCount === 1 ? "" : "s"} to discard.`,
+    actions
+  );
 }
 
 async function toggleTwoOneDiscard(cardId) {
@@ -1332,6 +1442,7 @@ function leaveRoom() {
 
 els.createRoomBtn.addEventListener("click", createRoom);
 els.joinRoomBtn.addEventListener("click", joinRoom);
+els.startBtn.addEventListener("click", startGame);
 els.deckBtn.addEventListener("click", () => drawAction(false));
 els.leaveBtn.addEventListener("click", leaveRoom);
 
@@ -1346,4 +1457,3 @@ boot();
 </script>
   </body>
 </html>
-
